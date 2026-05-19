@@ -215,6 +215,7 @@ def load_drone_image(image_path: str, verbose: bool = True) -> tuple:
 
 
 if __name__ == '__main__':
+    # Entry point of data loading
     path = sys.argv[1] if len(sys.argv) > 1 else '../data/Drone_SAMPLE.tiff'
     img, meta = load_drone_image(path)
     print("Metadata:", meta)
