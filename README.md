@@ -30,7 +30,7 @@ drone_ai_assignment/
 
 ```bash
 # 1. Clone / download
-git clone https://github.com/himanshu2285/drone-imagery-ai.git
+git clone [https://github.com//drone-imagery-ai.git](https://github.com/AnjaliYadav-04/AI-Drone-Imagery/
 cd drone-imagery-ai
 
 # 2. Create virtual environment
