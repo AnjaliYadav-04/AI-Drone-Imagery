@@ -1,226 +1,634 @@
-# File to load the data
+"""
+Drone Image Data Loader
+
+Supports:
+    - GeoTIFF / TIFF
+    - JPG / JPEG
+    - PNG
+
+The loader converts the input image into:
+    (H, W, 3) uint8 RGB
+
+For GeoTIFF files, rasterio is preferred when available.
+"""
 
 import os
-import sys
 import numpy as np
 import cv2
 from PIL import Image
 
-# This is Optional rasterio for full GeoTIFF metadata
+# Optional libraries
 try:
     import rasterio
-    _RASTERIO = True
+    RASTERIO_AVAILABLE = True
 except ImportError:
-    _RASTERIO = False
+    RASTERIO_AVAILABLE = False
 
 try:
     import tifffile
-    _TIFFFILE = True
+    TIFFFILE_AVAILABLE = True
 except ImportError:
-    _TIFFFILE = False
-
-
-SUPPORTED_EXT = {'.tif', '.tiff', '.jpg', '.jpeg', '.png'}
+    TIFFFILE_AVAILABLE = False
 
 
 class DroneImageLoader:
 
-    def __init__(self, image_path: str, verbose: bool = True):
+    SUPPORTED_EXT = {
+        ".tif",
+        ".tiff",
+        ".jpg",
+        ".jpeg",
+        ".png",
+    }
+
+    def __init__(self, image_path, verbose=True):
         self.image_path = os.path.abspath(image_path)
-        self.verbose    = verbose
+        self.verbose = verbose
+
+        self.image = None
+        self.metadata = {}
+        self.geo_metadata = {}
 
         if not os.path.exists(self.image_path):
             raise FileNotFoundError(
-                f"[DataLoader] File not found: {self.image_path}\n"
-                f"  → Place Drone_SAMPLE.tiff inside the data/ folder."
+                f"Image not found:\n{self.image_path}"
             )
 
-        self._ext = os.path.splitext(self.image_path)[1].lower()
-        if self._ext not in SUPPORTED_EXT:
+        ext = os.path.splitext(self.image_path)[1].lower()
+
+        if ext not in self.SUPPORTED_EXT:
             raise ValueError(
-                f"[DataLoader] Unsupported extension '{self._ext}'. "
-                f"Supported: {SUPPORTED_EXT}"
+                f"Unsupported image format: {ext}\n"
+                f"Supported formats: {sorted(self.SUPPORTED_EXT)}"
             )
 
-        self.image    : np.ndarray = None   # (H, W, 3) uint8
-        self.metadata : dict       = {}
+    # ---------------------------------------------------------
+    # MAIN LOAD FUNCTION
+    # ---------------------------------------------------------
 
+    def load(self):
+        """
+        Load image and return RGB uint8 array.
 
-    def load(self) -> np.ndarray:
-        # To Load the image and return a (H, W, 3) uint8 RGB numpy array.
-        self._log(f"Loading: {os.path.basename(self.image_path)}")
+        Returns
+        -------
+        np.ndarray
+            Shape: (H, W, 3)
+            dtype: uint8
+        """
 
-        if self._ext in ('.tif', '.tiff'):
-            self.image = self._load_tiff()
+        ext = os.path.splitext(self.image_path)[1].lower()
+
+        if ext in {".tif", ".tiff"}:
+            image = self._load_tiff()
         else:
-            self.image = self._load_standard()
+            image = self._load_standard_image()
+
+        image = self._to_rgb_uint8(image)
+
+        self.image = image
 
         self._build_metadata()
-        self._print_summary()
+
+        if self.verbose:
+            self._print_metadata()
+
         return self.image
 
-    def load_as_tiles(self, tile_size: int = 256, overlap: int = 32) -> list:
-        """Split the loaded image into overlapping tiles."""
-        if self.image is None:
-            self.load()
+    # ---------------------------------------------------------
+    # TIFF / GEOTIFF
+    # ---------------------------------------------------------
 
-        H, W  = self.image.shape[:2]
-        step  = tile_size - overlap
-        tiles = []
-        row   = 0
+    def _load_tiff(self):
+        """
+        Load TIFF / GeoTIFF.
 
-        for y in range(0, H, step):
-            col = 0
-            for x in range(0, W, step):
-                y1   = min(y + tile_size, H)
-                x1   = min(x + tile_size, W)
-                tile = self.image[y:y1, x:x1].copy()
+        rasterio is preferred because it can preserve
+        geospatial metadata such as CRS and transform.
+        """
 
-                # Pad with reflection to reach full tile_size
-                ph = tile_size - tile.shape[0]
-                pw = tile_size - tile.shape[1]
-                if ph > 0 or pw > 0:
-                    tile = np.pad(tile, ((0, ph), (0, pw), (0, 0)),
-                                  mode='reflect')
+        # ---------------------------------------------
+        # Preferred method: rasterio
+        # ---------------------------------------------
 
-                tiles.append({
-                    'tile': tile, 'row': row, 'col': col,
-                    'y0': y, 'x0': x, 'y1': y1, 'x1': x1,
-                })
-                col += 1
-            row += 1
+        if RASTERIO_AVAILABLE:
 
-        self._log(f"Tiling → {len(tiles)} tiles "
-                  f"({row} rows × {col} cols, "
-                  f"tile_size={tile_size}, overlap={overlap})")
-        return tiles
-
-    def tile_grid_shape(self, tile_size: int, overlap: int) -> tuple:
-        """Return (n_rows, n_cols) of the tile grid."""
-        if self.image is None:
-            self.load()
-        H, W = self.image.shape[:2]
-        step = tile_size - overlap
-        return (int(np.ceil(H / step)), int(np.ceil(W / step)))
-
-    # For Private loaders
-
-    def _load_tiff(self) -> np.ndarray:
-        """Load TIFF: tifffile → PIL → OpenCV fallback chain."""
-        if _TIFFFILE:
             try:
-                arr = tifffile.imread(self.image_path)
-                self._log(f"  [tifffile] raw shape={arr.shape}, dtype={arr.dtype}")
-                return self._to_rgb_uint8(arr)
+                with rasterio.open(self.image_path) as src:
+
+                    data = src.read()
+
+                    # Save GeoTIFF metadata
+                    self.geo_metadata = {
+                        "driver": src.driver,
+                        "width": src.width,
+                        "height": src.height,
+                        "count": src.count,
+                        "dtype": str(src.dtypes[0]),
+                        "crs": str(src.crs) if src.crs else None,
+                        "transform": str(src.transform),
+                        "bounds": tuple(src.bounds),
+                        "resolution": tuple(src.res),
+                    }
+
+                    if self.verbose:
+                        print("  TIFF reader : rasterio")
+                        print(f"  Bands       : {src.count}")
+
+                        if src.crs:
+                            print(f"  CRS         : {src.crs}")
+
+                    return data
+
             except Exception as e:
-                self._log(f"  [tifffile] failed ({e}) → trying PIL …")
+
+                if self.verbose:
+                    print(
+                        f"  rasterio TIFF read failed: {e}"
+                    )
+
+        # ---------------------------------------------
+        # Fallback: tifffile
+        # ---------------------------------------------
+
+        if TIFFFILE_AVAILABLE:
+
+            try:
+
+                data = tifffile.imread(self.image_path)
+
+                if self.verbose:
+                    print("  TIFF reader : tifffile")
+
+                return data
+
+            except Exception as e:
+
+                if self.verbose:
+                    print(
+                        f"  tifffile read failed: {e}"
+                    )
+
+        # ---------------------------------------------
+        # Final fallback: PIL
+        # ---------------------------------------------
 
         try:
-            pil = Image.open(self.image_path).convert('RGB')
-            return np.array(pil, dtype=np.uint8)
+
+            image = Image.open(self.image_path)
+
+            if self.verbose:
+                print("  TIFF reader : PIL")
+
+            return np.array(image)
+
         except Exception as e:
-            self._log(f"  [PIL] failed ({e}) → trying OpenCV …")
 
-        arr = cv2.imread(self.image_path, cv2.IMREAD_UNCHANGED)
-        if arr is None:
-            raise IOError(f"[DataLoader] Cannot read: {self.image_path}")
-        return self._to_rgb_uint8(arr)
+            raise RuntimeError(
+                f"Unable to read TIFF file:\n"
+                f"{self.image_path}\n\n"
+                f"Error: {e}"
+            )
 
-    def _load_standard(self) -> np.ndarray:
-        """Load JPEG / PNG via OpenCV (BGR → RGB)."""
-        arr = cv2.imread(self.image_path, cv2.IMREAD_COLOR)
-        if arr is None:
-            raise IOError(f"[DataLoader] OpenCV failed: {self.image_path}")
-        return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    # ---------------------------------------------------------
+    # JPG / PNG
+    # ---------------------------------------------------------
 
+    def _load_standard_image(self):
 
-    @staticmethod
-    def _to_rgb_uint8(arr: np.ndarray) -> np.ndarray:
-        """
-        Robustly convert any raw ndarray to (H, W, 3) uint8 RGB.
-        Handles:  (C,H,W), (H,W), (H,W,1), (H,W,4), uint16, float32
-        """
-        # Band-first → band-last
-        if arr.ndim == 3 and arr.shape[0] < arr.shape[1] and arr.shape[0] in (1,3,4,5):
-            arr = np.transpose(arr, (1, 2, 0))
+        image = cv2.imread(
+            self.image_path,
+            cv2.IMREAD_UNCHANGED
+        )
 
-        # Grayscale → RGB
+        if image is None:
+            raise RuntimeError(
+                f"OpenCV could not read:\n"
+                f"{self.image_path}"
+            )
+
+        # OpenCV BGR -> RGB
+        if image.ndim == 3:
+
+            if image.shape[2] >= 3:
+
+                image = cv2.cvtColor(
+                    image[:, :, :3],
+                    cv2.COLOR_BGR2RGB
+                )
+
+        return image
+
+    # ---------------------------------------------------------
+    # CONVERT TO RGB UINT8
+    # ---------------------------------------------------------
+
+    def _to_rgb_uint8(self, arr):
+
+        arr = np.asarray(arr)
+
+        if arr.size == 0:
+            raise ValueError("Image contains no data.")
+
+        # Remove singleton dimensions
+        arr = np.squeeze(arr)
+
+        # -----------------------------------------------------
+        # 2D grayscale
+        # -----------------------------------------------------
+
         if arr.ndim == 2:
-            arr = np.stack([arr]*3, axis=-1)
-        if arr.ndim == 3 and arr.shape[2] == 1:
-            arr = np.concatenate([arr]*3, axis=-1)
 
-        # Drop extra bands (keep first 3)
-        if arr.ndim == 3 and arr.shape[2] > 3:
-            arr = arr[:, :, :3]
+            arr = self._scale_to_uint8(arr)
 
-        # Stretch to uint8 [0,255] using 2-98 percentile
+            arr = np.stack(
+                [arr, arr, arr],
+                axis=-1
+            )
+
+            return arr
+
+        # -----------------------------------------------------
+        # 3D data
+        # -----------------------------------------------------
+
+        if arr.ndim == 3:
+
+            # Detect CHW format
+            if (
+                arr.shape[0] in (1, 3, 4, 5, 6, 8, 10, 12)
+                and arr.shape[0] < arr.shape[1]
+                and arr.shape[0] < arr.shape[2]
+            ):
+                arr = np.transpose(
+                    arr,
+                    (1, 2, 0)
+                )
+
+            # -------------------------------------------------
+            # Single band
+            # -------------------------------------------------
+
+            if arr.shape[2] == 1:
+
+                band = self._scale_to_uint8(
+                    arr[:, :, 0]
+                )
+
+                return np.stack(
+                    [band, band, band],
+                    axis=-1
+                )
+
+            # -------------------------------------------------
+            # RGB
+            # -------------------------------------------------
+
+            if arr.shape[2] >= 3:
+
+                arr = arr[:, :, :3]
+
+                arr = self._scale_rgb_to_uint8(arr)
+
+                return arr
+
+        raise ValueError(
+            "Unsupported image array shape: "
+            f"{arr.shape}"
+        )
+
+    # ---------------------------------------------------------
+    # SCALE SINGLE BAND
+    # ---------------------------------------------------------
+
+    def _scale_to_uint8(self, arr):
+
+        arr = np.asarray(arr)
+
+        if arr.dtype == np.uint8:
+            return arr
+
         arr = arr.astype(np.float32)
-        lo, hi = np.percentile(arr, 2), np.percentile(arr, 98)
-        if hi > lo:
-            arr = np.clip((arr - lo) / (hi - lo) * 255.0, 0, 255)
-        else:
-            arr = np.clip(arr, 0, 255)
+
+        finite = np.isfinite(arr)
+
+        if not np.any(finite):
+            return np.zeros(
+                arr.shape,
+                dtype=np.uint8
+            )
+
+        valid = arr[finite]
+
+        # Percentile stretch
+        low = np.percentile(valid, 2)
+        high = np.percentile(valid, 98)
+
+        if high <= low:
+            low = valid.min()
+            high = valid.max()
+
+        if high <= low:
+            return np.zeros(
+                arr.shape,
+                dtype=np.uint8
+            )
+
+        arr = np.clip(
+            arr,
+            low,
+            high
+        )
+
+        arr = (
+            (arr - low)
+            / (high - low)
+            * 255.0
+        )
+
+        arr = np.nan_to_num(
+            arr,
+            nan=0.0,
+            posinf=255.0,
+            neginf=0.0
+        )
+
         return arr.astype(np.uint8)
 
+    # ---------------------------------------------------------
+    # SCALE RGB
+    # ---------------------------------------------------------
+
+    def _scale_rgb_to_uint8(self, arr):
+
+        if arr.dtype == np.uint8:
+            return arr
+
+        output = np.zeros(
+            arr.shape,
+            dtype=np.uint8
+        )
+
+        for band in range(3):
+
+            output[:, :, band] = (
+                self._scale_to_uint8(
+                    arr[:, :, band]
+                )
+            )
+
+        return output
+
+    # ---------------------------------------------------------
+    # METADATA
+    # ---------------------------------------------------------
+
     def _build_metadata(self):
-        H, W, C = self.image.shape
+
+        h, w, c = self.image.shape
+
         self.metadata = {
-            'file'        : os.path.basename(self.image_path),
-            'path'        : self.image_path,
-            'size_kb'     : os.path.getsize(self.image_path) // 1024,
-            'height_px'   : H,
-            'width_px'    : W,
-            'channels'    : C,
-            'dtype'       : str(self.image.dtype),
-            'pixel_min'   : int(self.image.min()),
-            'pixel_max'   : int(self.image.max()),
-            'pixel_mean'  : round(float(self.image.mean()), 2),
-            'memory_mb'   : round(self.image.nbytes / 1_048_576, 2),
+
+            "file": os.path.basename(
+                self.image_path
+            ),
+
+            "path": self.image_path,
+
+            "width_px": int(w),
+
+            "height_px": int(h),
+
+            "channels": int(c),
+
+            "dtype": str(
+                self.image.dtype
+            ),
+
+            "pixel_min": int(
+                self.image.min()
+            ),
+
+            "pixel_max": int(
+                self.image.max()
+            ),
+
+            "pixel_mean": float(
+                self.image.mean()
+            ),
+
+            "memory_mb": float(
+                self.image.nbytes
+                / (1024 ** 2)
+            ),
+
         }
 
-    def _print_summary(self):
-        if not self.verbose:
-            return
-        m  = self.metadata
-        ln = "─" * 50
-        print(f"\n  {ln}")
-        print(f"  ✔  Image loaded successfully")
-        print(f"  {ln}")
-        print(f"  File        : {m['file']}")
-        print(f"  Disk size   : {m['size_kb']} KB")
-        print(f"  Dimensions  : {m['height_px']} H × {m['width_px']} W × {m['channels']} C")
-        print(f"  Dtype       : {m['dtype']}")
-        print(f"  Pixel range : [{m['pixel_min']}, {m['pixel_max']}]  "
-              f"mean = {m['pixel_mean']}")
-        print(f"  Memory      : {m['memory_mb']} MB")
-        print(f"  {ln}\n")
+        # Add GeoTIFF information
+        if self.geo_metadata:
 
-    def _log(self, msg: str):
-        if self.verbose:
-            print(f"[DataLoader] {msg}")
+            self.metadata.update(
+                {
+                    "crs": self.geo_metadata.get(
+                        "crs"
+                    ),
+
+                    "resolution": self.geo_metadata.get(
+                        "resolution"
+                    ),
+
+                    "bounds": self.geo_metadata.get(
+                        "bounds"
+                    ),
+                }
+            )
+
+    # ---------------------------------------------------------
+    # PRINT METADATA
+    # ---------------------------------------------------------
+
+    def _print_metadata(self):
+
+        print("\nImage Metadata")
+        print("-" * 50)
+
+        print(
+            f"  File       : "
+            f"{self.metadata['file']}"
+        )
+
+        print(
+            f"  Dimensions : "
+            f"{self.metadata['width_px']} × "
+            f"{self.metadata['height_px']}"
+        )
+
+        print(
+            f"  Channels   : "
+            f"{self.metadata['channels']}"
+        )
+
+        print(
+            f"  Data type  : "
+            f"{self.metadata['dtype']}"
+        )
+
+        print(
+            f"  Pixel min  : "
+            f"{self.metadata['pixel_min']}"
+        )
+
+        print(
+            f"  Pixel max  : "
+            f"{self.metadata['pixel_max']}"
+        )
+
+        print(
+            f"  Pixel mean : "
+            f"{self.metadata['pixel_mean']:.2f}"
+        )
+
+        print(
+            f"  Memory     : "
+            f"{self.metadata['memory_mb']:.2f} MB"
+        )
+
+        if self.geo_metadata:
+
+            print("\nGeoTIFF Metadata")
+            print("-" * 50)
+
+            print(
+                f"  CRS        : "
+                f"{self.geo_metadata.get('crs')}"
+            )
+
+            print(
+                f"  Resolution : "
+                f"{self.geo_metadata.get('resolution')}"
+            )
+
+            print(
+                f"  Bounds     : "
+                f"{self.geo_metadata.get('bounds')}"
+            )
+
+    # ---------------------------------------------------------
+    # TILING
+    # ---------------------------------------------------------
+
+    def tile_image(
+        self,
+        tile_size=64,
+        overlap=0
+    ):
+        """
+        Split image into tiles.
+
+        Returns
+        -------
+        patches : list
+        positions : list
+        """
+
+        if self.image is None:
+            self.load()
+
+        image = self.image
+
+        h, w, _ = image.shape
+
+        stride = tile_size - overlap
+
+        if stride <= 0:
+            raise ValueError(
+                "overlap must be smaller than tile_size"
+            )
+
+        patches = []
+        positions = []
+
+        for y in range(
+            0,
+            h - tile_size + 1,
+            stride
+        ):
+
+            for x in range(
+                0,
+                w - tile_size + 1,
+                stride
+            ):
+
+                patch = image[
+                    y:y + tile_size,
+                    x:x + tile_size
+                ]
+
+                patches.append(patch)
+
+                positions.append(
+                    (x, y)
+                )
+
+        return patches, positions
 
 
-def load_drone_image(image_path: str, verbose: bool = True) -> tuple:
-    """
-    One-liner to load a drone image.
+# -------------------------------------------------------------
+# SIMPLE FUNCTION
+# -------------------------------------------------------------
 
-    Returns
-    -------
-    (image: np.ndarray (H,W,3) uint8,  metadata: dict)
-    """
-    loader = DroneImageLoader(image_path, verbose=verbose)
-    image  = loader.load()
-    return image, loader.metadata
+def load_drone_image(image_path):
+
+    loader = DroneImageLoader(
+        image_path,
+        verbose=True
+    )
+
+    return loader.load()
 
 
-if __name__ == '__main__':
-    # Entry point of data loading
-    path = sys.argv[1] if len(sys.argv) > 1 else '../data/Drone_SAMPLE.tiff'
-    img, meta = load_drone_image(path)
-    print("Metadata:", meta)
-    loader = DroneImageLoader(path, verbose=False)
-    loader.load()
-    tiles = loader.load_as_tiles(256, 32)
-    print(f"Tile count : {len(tiles)}")
-    print(f"Tile shape : {tiles[0]['tile'].shape}")
+# -------------------------------------------------------------
+# TEST
+# -------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    current_dir = os.path.dirname(
+        os.path.abspath(__file__)
+    )
+
+    image_path = os.path.join(
+        current_dir,
+        "..",
+        "data",
+        "Drone_SAMPLE.tif"
+    )
+
+    image_path = os.path.abspath(
+        image_path
+    )
+
+    print(
+        f"Testing image loader:\n"
+        f"{image_path}"
+    )
+
+    loader = DroneImageLoader(
+        image_path,
+        verbose=True
+    )
+
+    image = loader.load()
+
+    print("\nLoader test successful.")
+
+    print(
+        f"Final image shape : "
+        f"{image.shape}"
+    )
+
+    print(
+        f"Final dtype       : "
+        f"{image.dtype}"
+    )
